@@ -230,3 +230,126 @@
       (var-set total-active-keys (+ (var-get total-active-keys) u1))
       (var-set platform-revenue (+ (var-get platform-revenue) platform-fee))
       (ok key-id))))
+
+(define-public (use-api-key 
+  (key-id uint)
+  (calls-to-use uint)
+  (endpoint (string-ascii 128))
+  (response-size uint)
+  (success bool)
+  (error-code (optional uint)))
+  (let ((key-info (unwrap! (map-get? api-keys key-id) err-not-found))
+        (caller tx-sender))
+    (asserts! (is-eq caller (get owner key-info)) err-unauthorized)
+    (asserts! (get active key-info) err-unauthorized)
+    (asserts! (>= (get calls-remaining key-info) calls-to-use) err-usage-exceeded)
+    
+    ;; Check if period has expired and needs renewal
+    (let ((current-key (if (> block-height (get period-end key-info))
+                         (if (get auto-renewal key-info)
+                           (try! (renew-key-period key-id))
+                           key-info)
+                         key-info)))
+      
+      ;; Check if still valid after potential renewal
+      (asserts! (<= block-height (get period-end current-key)) err-subscription-expired)
+      
+      ;; Log usage
+      (let ((log-id (default-to u0 (map-get? key-usage-counter key-id))))
+        (map-set api-usage-logs 
+          {key-id: key-id, log-id: (+ log-id u1)}
+          {
+            timestamp: block-height,
+            calls-used: calls-to-use,
+            endpoint: endpoint,
+            response-size: response-size,
+            success: success,
+            error-code: error-code
+          })
+        
+        (map-set key-usage-counter key-id (+ log-id u1)))
+      
+      ;; Update key usage and user reputation
+      (let ((updated-key (merge current-key {
+              calls-remaining: (- (get calls-remaining current-key) calls-to-use),
+              total-calls-made: (+ (get total-calls-made current-key) calls-to-use),
+              last-used: block-height
+            })))
+        (map-set api-keys key-id updated-key)
+        (update-user-reputation caller (get service-id key-info) calls-to-use)
+        (ok updated-key)))))
+
+(define-public (request-refund (key-id uint))
+  (let ((key-info (unwrap! (map-get? api-keys key-id) err-not-found))
+        (service (unwrap! (map-get? api-services (get service-id key-info)) err-not-found))
+        (caller tx-sender))
+    
+    (asserts! (is-eq caller (get owner key-info)) err-unauthorized)
+    (asserts! (get active key-info) err-not-found)
+    (asserts! (<= block-height (get refund-eligible-until key-info)) err-refund-failed)
+    (asserts! (is-eq (get total-calls-made key-info) u0) err-refund-failed)
+    
+    (let ((refund-amount (/ (* (get price-per-call service) (get calls-remaining key-info)) u1))
+          (platform-fee (/ (* refund-amount platform-fee-rate) u10000)))
+      
+      (try! (stx-transfer? (- refund-amount platform-fee) (get provider service) caller))
+      
+      ;; Deactivate the key
+      (map-set api-keys key-id (merge key-info {active: false, calls-remaining: u0}))
+      
+      (var-set total-active-keys (- (var-get total-active-keys) u1))
+      (ok refund-amount))))
+
+(define-private (renew-key-period (key-id uint))
+  (let ((key-info (unwrap! (map-get? api-keys key-id) err-not-found))
+        (service (unwrap! (map-get? api-services (get service-id key-info)) err-not-found))
+        (tier (map-get? subscription-tiers {service-id: (get service-id key-info), tier-id: (get subscription-tier key-info)})))
+    
+    (let ((calls-allowed (if (is-some tier)
+                          (get max-calls (unwrap-panic tier))
+                          (get max-calls-per-period service)))
+          (price-multiplier (if (is-some tier)
+                            (get price-multiplier (unwrap-panic tier))
+                            u100))
+          (renewal-cost (/ (* (* (get price-per-call service) calls-allowed) price-multiplier) u100))
+          (platform-fee (/ (* renewal-cost platform-fee-rate) u10000)))
+      
+      (asserts! (>= (stx-get-balance (get owner key-info)) renewal-cost) err-insufficient-payment)
+      
+      (try! (stx-transfer? platform-fee (get owner key-info) contract-owner))
+      (try! (stx-transfer? (- renewal-cost platform-fee) (get owner key-info) (get provider service)))
+      
+      (let ((updated-key {
+              service-id: (get service-id key-info),
+              owner: (get owner key-info),
+              calls-remaining: calls-allowed,
+              period-start: block-height,
+              period-end: (+ block-height (get period-duration service)),
+              total-calls-made: (get total-calls-made key-info),
+              created-at: (get created-at key-info),
+              active: true,
+              subscription-tier: (get subscription-tier key-info),
+              auto-renewal: (get auto-renewal key-info),
+              last-used: (get last-used key-info),
+              refund-eligible-until: (+ block-height max-refund-period)
+            }))
+        (map-set api-keys key-id updated-key)
+        (var-set platform-revenue (+ (var-get platform-revenue) platform-fee))
+        (ok updated-key)))))
+
+(define-public (transfer-api-key (key-id uint) (recipient principal))
+  (let ((caller tx-sender))
+    (asserts! (is-eq caller (unwrap! (nft-get-owner? api-key-nft key-id) err-not-found)) err-unauthorized)
+    
+    (try! (nft-transfer? api-key-nft key-id caller recipient))
+    
+    (let ((key-info (unwrap! (map-get? api-keys key-id) err-not-found)))
+      (ok (map-set api-keys key-id
+        (merge key-info {owner: recipient}))))))
+
+(define-public (toggle-auto-renewal (key-id uint) (enable bool))
+  (let ((key-info (unwrap! (map-get? api-keys key-id) err-not-found))
+        (caller tx-sender))
+    (asserts! (is-eq caller (get owner key-info)) err-unauthorized)
+    (ok (map-set api-keys key-id
+      (merge key-info {auto-renewal: enable})))))
