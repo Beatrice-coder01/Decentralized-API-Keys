@@ -353,3 +353,106 @@
     (asserts! (is-eq caller (get owner key-info)) err-unauthorized)
     (ok (map-set api-keys key-id
       (merge key-info {auto-renewal: enable})))))
+
+
+(define-private (update-user-reputation (user principal) (service-id uint) (calls-made uint))
+  (let ((current-rep (default-to 
+                       {total-api-calls: u0, services-used: u0, reputation-score: u100, violations: u0, join-date: block-height}
+                       (map-get? user-reputation user))))
+    (map-set user-reputation user
+      (merge current-rep {
+        total-api-calls: (+ (get total-api-calls current-rep) calls-made),
+        services-used: (if (> calls-made u0) 
+                        (+ (get services-used current-rep) u1)
+                        (get services-used current-rep)),
+        reputation-score: (min u1000 (+ (get reputation-score current-rep) (/ calls-made u10)))
+      }))
+    true))
+
+(define-public (deactivate-service (service-id uint))
+  (let ((service (unwrap! (map-get? api-services service-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get provider service)) err-unauthorized)
+    (ok (map-set api-services service-id
+      (merge service {active: false})))))
+
+(define-public (update-service-pricing 
+  (service-id uint)
+  (new-price-per-call uint)
+  (new-rate-limit uint))
+  (let ((service (unwrap! (map-get? api-services service-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get provider service)) err-unauthorized)
+    (asserts! (>= new-price-per-call min-service-price) err-invalid-parameters)
+    (ok (map-set api-services service-id
+      (merge service {
+        price-per-call: new-price-per-call,
+        rate-limit-per-second: new-rate-limit
+      })))))
+
+(define-public (emergency-deactivate-key (key-id uint))
+  (let ((key-info (unwrap! (map-get? api-keys key-id) err-not-found))
+        (service (unwrap! (map-get? api-services (get service-id key-info)) err-not-found)))
+    (asserts! (or (is-eq tx-sender contract-owner) 
+                  (is-eq tx-sender (get provider service))
+                  (is-eq tx-sender (get owner key-info))) err-unauthorized)
+    
+    (ok (map-set api-keys key-id
+      (merge key-info {active: false})))))
+
+(define-read-only (get-service-info (service-id uint))
+  (map-get? api-services service-id))
+
+(define-read-only (get-api-key-info (key-id uint))
+  (map-get? api-keys key-id))
+
+(define-read-only (get-usage-log (key-id uint) (log-id uint))
+  (map-get? api-usage-logs {key-id: key-id, log-id: log-id}))
+
+(define-read-only (get-subscription-tier (service-id uint) (tier-id uint))
+  (map-get? subscription-tiers {service-id: service-id, tier-id: tier-id}))
+
+(define-read-only (get-user-reputation (user principal))
+  (map-get? user-reputation user))
+
+(define-read-only (get-key-owner (key-id uint))
+  (nft-get-owner? api-key-nft key-id))
+
+(define-read-only (is-user-whitelisted (service-id uint) (user principal))
+  (default-to false (map-get? service-whitelist {service-id: service-id, user: user})))
+
+(define-read-only (get-platform-stats)
+  {
+    total-services: (var-get total-services),
+    total-active-keys: (var-get total-active-keys),
+    platform-revenue: (var-get platform-revenue),
+    next-service-id: (var-get next-service-id),
+    next-key-id: (var-get next-key-id)
+  })
+
+(define-read-only (check-key-validity (key-id uint))
+  (let ((key-info (map-get? api-keys key-id)))
+    (match key-info
+      key-data
+      {
+        valid: (and (get active key-data) 
+                    (> (get calls-remaining key-data) u0)
+                    (<= block-height (get period-end key-data))),
+        calls-remaining: (get calls-remaining key-data),
+        expires-at: (get period-end key-data),
+        owner: (get owner key-data),
+        auto-renewal: (get auto-renewal key-data),
+        last-used: (get last-used key-data)
+      }
+      {
+        valid: false,
+        calls-remaining: u0,
+        expires-at: u0,
+        owner: 'SP000000000000000000002Q6VF78,
+        auto-renewal: false,
+        last-used: u0
+      })))
+
+(define-read-only (get-service-revenue (service-id uint))
+  (let ((service (map-get? api-services service-id)))
+    (match service
+      service-data (get total-revenue service-data)
+      u0)))
