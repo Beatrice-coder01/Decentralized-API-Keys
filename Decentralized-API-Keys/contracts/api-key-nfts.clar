@@ -1,30 +1,463 @@
+;; Decentralized API Keys
+;; NFT-based API key management and monetization with advanced features
 
-;; title: api-key-nfts
-;; version:
-;; summary:
-;; description:
+(define-constant contract-owner tx-sender)
+(define-constant err-owner-only (err u100))
+(define-constant err-not-found (err u101))
+(define-constant err-unauthorized (err u102))
+(define-constant err-already-exists (err u103))
+(define-constant err-insufficient-payment (err u104))
+(define-constant err-usage-exceeded (err u105))
+(define-constant err-invalid-parameters (err u106))
+(define-constant err-service-inactive (err u107))
+(define-constant err-refund-failed (err u108))
+(define-constant err-already-whitelisted (err u109))
+(define-constant err-not-whitelisted (err u110))
+(define-constant err-tier-not-found (err u111))
+(define-constant err-subscription-expired (err u112))
 
-;; traits
-;;
+(define-constant max-refund-period u144) ;; ~1 day in blocks
+(define-constant platform-fee-rate u50) ;; 0.5% in basis points
+(define-constant min-service-price u1000) ;; Minimum price per call
+(define-constant max-reputation-score u1000) ;; Maximum reputation score
 
-;; token definitions
-;;
+(define-non-fungible-token api-key-nft uint)
 
-;; constants
-;;
+(define-map api-services
+  uint
+  {
+    provider: principal,
+    name: (string-ascii 64),
+    description: (string-ascii 256),
+    price-per-call: uint,
+    max-calls-per-period: uint,
+    period-duration: uint,
+    active: bool,
+    created-at: uint,
+    category: (string-ascii 32),
+    api-version: (string-ascii 16),
+    rate-limit-per-second: uint,
+    whitelisted-only: bool,
+    total-revenue: uint,
+    total-keys-sold: uint
+  })
 
-;; data vars
-;;
+(define-map api-keys
+  uint
+  {
+    service-id: uint,
+    owner: principal,
+    calls-remaining: uint,
+    period-start: uint,
+    period-end: uint,
+    total-calls-made: uint,
+    created-at: uint,
+    active: bool,
+    subscription-tier: uint,
+    auto-renewal: bool,
+    last-used: uint,
+    refund-eligible-until: uint
+  })
 
-;; data maps
-;;
+(define-map api-usage-logs
+  { key-id: uint, log-id: uint }
+  {
+    timestamp: uint,
+    calls-used: uint,
+    endpoint: (string-ascii 128),
+    response-size: uint,
+    success: bool,
+    error-code: (optional uint)
+  })
 
-;; public functions
-;;
+(define-map key-usage-counter
+  uint
+  uint)
 
-;; read only functions
-;;
+(define-map service-whitelist
+  { service-id: uint, user: principal }
+  bool)
 
-;; private functions
-;;
+(define-map subscription-tiers
+  { service-id: uint, tier-id: uint }
+  {
+    name: (string-ascii 32),
+    max-calls: uint,
+    price-multiplier: uint,
+    additional-features: (string-ascii 128)
+  })
 
+(define-map user-reputation
+  principal
+  {
+    total-api-calls: uint,
+    services-used: uint,
+    reputation-score: uint,
+    violations: uint,
+    join-date: uint
+  })
+
+(define-map service-analytics
+  { service-id: uint, period: uint }
+  {
+    total-calls: uint,
+    unique-users: uint,
+    revenue: uint,
+    average-response-time: uint
+  })
+
+(define-data-var next-service-id uint u1)
+(define-data-var next-key-id uint u1)
+(define-data-var platform-revenue uint u0)
+(define-data-var total-services uint u0)
+(define-data-var total-active-keys uint u0)
+
+;; Helper function to get minimum of two values
+(define-private (get-min (a uint) (b uint))
+  (if (<= a b) a b))
+
+(define-public (register-api-service 
+  (name (string-ascii 64))
+  (description (string-ascii 256))
+  (price-per-call uint)
+  (max-calls-per-period uint)
+  (period-duration uint)
+  (category (string-ascii 32))
+  (api-version (string-ascii 16))
+  (rate-limit-per-second uint)
+  (whitelisted-only bool))
+  (let ((caller tx-sender)
+        (service-id (var-get next-service-id)))
+    (asserts! (>= price-per-call min-service-price) err-invalid-parameters)
+    (asserts! (> max-calls-per-period u0) err-invalid-parameters)
+    (asserts! (> period-duration u0) err-invalid-parameters)
+    
+    (map-set api-services service-id {
+      provider: caller,
+      name: name,
+      description: description,
+      price-per-call: price-per-call,
+      max-calls-per-period: max-calls-per-period,
+      period-duration: period-duration,
+      active: true,
+      created-at: stacks-block-height,
+      category: category,
+      api-version: api-version,
+      rate-limit-per-second: rate-limit-per-second,
+      whitelisted-only: whitelisted-only,
+      total-revenue: u0,
+      total-keys-sold: u0
+    })
+    
+    (var-set next-service-id (+ service-id u1))
+    (var-set total-services (+ (var-get total-services) u1))
+    (ok service-id)))
+
+(define-public (create-subscription-tier
+  (service-id uint)
+  (tier-id uint)
+  (name (string-ascii 32))
+  (max-calls uint)
+  (price-multiplier uint)
+  (additional-features (string-ascii 128)))
+  (let ((service (unwrap! (map-get? api-services service-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get provider service)) err-unauthorized)
+    (asserts! (not (is-some (map-get? subscription-tiers {service-id: service-id, tier-id: tier-id}))) err-already-exists)
+    
+    (ok (map-set subscription-tiers {service-id: service-id, tier-id: tier-id} {
+      name: name,
+      max-calls: max-calls,
+      price-multiplier: price-multiplier,
+      additional-features: additional-features
+    }))))
+
+(define-public (add-to-whitelist (service-id uint) (user principal))
+  (let ((service (unwrap! (map-get? api-services service-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get provider service)) err-unauthorized)
+    (asserts! (not (default-to false (map-get? service-whitelist {service-id: service-id, user: user}))) err-already-whitelisted)
+    
+    (ok (map-set service-whitelist {service-id: service-id, user: user} true))))
+
+(define-public (purchase-api-key (service-id uint) (subscription-tier uint) (enable-auto-renewal bool))
+  (let ((caller tx-sender)
+        (service (unwrap! (map-get? api-services service-id) err-not-found))
+        (key-id (var-get next-key-id))
+        (tier (map-get? subscription-tiers {service-id: service-id, tier-id: subscription-tier})))
+    
+    (asserts! (get active service) err-service-inactive)
+    
+    ;; Check whitelist if required
+    (if (get whitelisted-only service)
+      (asserts! (default-to false (map-get? service-whitelist {service-id: service-id, user: caller})) err-not-whitelisted)
+      true)
+    
+    (let ((calls-allowed (if (is-some tier)
+                          (get max-calls (unwrap-panic tier))
+                          (get max-calls-per-period service)))
+          (price-multiplier (if (is-some tier)
+                            (get price-multiplier (unwrap-panic tier))
+                            u100))
+          (total-cost (/ (* (* (get price-per-call service) calls-allowed) price-multiplier) u100))
+          (platform-fee (/ (* total-cost platform-fee-rate) u10000)))
+      
+      (asserts! (>= (stx-get-balance caller) total-cost) err-insufficient-payment)
+      
+      (try! (stx-transfer? platform-fee caller contract-owner))
+      (try! (stx-transfer? (- total-cost platform-fee) caller (get provider service)))
+      (try! (nft-mint? api-key-nft key-id caller))
+      
+      (map-set api-keys key-id {
+        service-id: service-id,
+        owner: caller,
+        calls-remaining: calls-allowed,
+        period-start: stacks-block-height,
+        period-end: (+ stacks-block-height (get period-duration service)),
+        total-calls-made: u0,
+        created-at: stacks-block-height,
+        active: true,
+        subscription-tier: subscription-tier,
+        auto-renewal: enable-auto-renewal,
+        last-used: u0,
+        refund-eligible-until: (+ stacks-block-height max-refund-period)
+      })
+      
+      ;; Update service statistics
+      (map-set api-services service-id
+        (merge service {
+          total-revenue: (+ (get total-revenue service) (- total-cost platform-fee)),
+          total-keys-sold: (+ (get total-keys-sold service) u1)
+        }))
+      
+      ;; Update user reputation
+      (update-user-reputation caller service-id u0)
+      
+      (var-set next-key-id (+ key-id u1))
+      (var-set total-active-keys (+ (var-get total-active-keys) u1))
+      (var-set platform-revenue (+ (var-get platform-revenue) platform-fee))
+      (ok key-id))))
+
+(define-public (use-api-key 
+  (key-id uint)
+  (calls-to-use uint)
+  (endpoint (string-ascii 128))
+  (response-size uint)
+  (success bool)
+  (error-code (optional uint)))
+  (let ((key-info (unwrap! (map-get? api-keys key-id) err-not-found))
+        (caller tx-sender))
+    (asserts! (is-eq caller (get owner key-info)) err-unauthorized)
+    (asserts! (get active key-info) err-unauthorized)
+    (asserts! (>= (get calls-remaining key-info) calls-to-use) err-usage-exceeded)
+    
+    ;; Check if period has expired and needs renewal
+    (let ((current-key (if (> stacks-block-height (get period-end key-info))
+                         (if (get auto-renewal key-info)
+                           (try! (renew-key-period key-id))
+                           key-info)
+                         key-info)))
+      
+      ;; Check if still valid after potential renewal
+      (asserts! (<= stacks-block-height (get period-end current-key)) err-subscription-expired)
+      
+      ;; Log usage
+      (let ((log-id (default-to u0 (map-get? key-usage-counter key-id))))
+        (map-set api-usage-logs 
+          {key-id: key-id, log-id: (+ log-id u1)}
+          {
+            timestamp: stacks-block-height,
+            calls-used: calls-to-use,
+            endpoint: endpoint,
+            response-size: response-size,
+            success: success,
+            error-code: error-code
+          })
+        
+        (map-set key-usage-counter key-id (+ log-id u1)))
+      
+      ;; Update key usage and user reputation
+      (let ((updated-key (merge current-key {
+              calls-remaining: (- (get calls-remaining current-key) calls-to-use),
+              total-calls-made: (+ (get total-calls-made current-key) calls-to-use),
+              last-used: stacks-block-height
+            })))
+        (map-set api-keys key-id updated-key)
+        (update-user-reputation caller (get service-id key-info) calls-to-use)
+        (ok updated-key)))))
+
+(define-public (request-refund (key-id uint))
+  (let ((key-info (unwrap! (map-get? api-keys key-id) err-not-found))
+        (service (unwrap! (map-get? api-services (get service-id key-info)) err-not-found))
+        (caller tx-sender))
+    
+    (asserts! (is-eq caller (get owner key-info)) err-unauthorized)
+    (asserts! (get active key-info) err-not-found)
+    (asserts! (<= stacks-block-height (get refund-eligible-until key-info)) err-refund-failed)
+    (asserts! (is-eq (get total-calls-made key-info) u0) err-refund-failed)
+    
+    (let ((refund-amount (/ (* (get price-per-call service) (get calls-remaining key-info)) u1))
+          (platform-fee (/ (* refund-amount platform-fee-rate) u10000)))
+      
+      (try! (stx-transfer? (- refund-amount platform-fee) (get provider service) caller))
+      
+      ;; Deactivate the key
+      (map-set api-keys key-id (merge key-info {active: false, calls-remaining: u0}))
+      
+      (var-set total-active-keys (- (var-get total-active-keys) u1))
+      (ok refund-amount))))
+
+(define-private (renew-key-period (key-id uint))
+  (let ((key-info (unwrap! (map-get? api-keys key-id) err-not-found))
+        (service (unwrap! (map-get? api-services (get service-id key-info)) err-not-found))
+        (tier (map-get? subscription-tiers {service-id: (get service-id key-info), tier-id: (get subscription-tier key-info)})))
+    
+    (let ((calls-allowed (if (is-some tier)
+                          (get max-calls (unwrap-panic tier))
+                          (get max-calls-per-period service)))
+          (price-multiplier (if (is-some tier)
+                            (get price-multiplier (unwrap-panic tier))
+                            u100))
+          (renewal-cost (/ (* (* (get price-per-call service) calls-allowed) price-multiplier) u100))
+          (platform-fee (/ (* renewal-cost platform-fee-rate) u10000)))
+      
+      (asserts! (>= (stx-get-balance (get owner key-info)) renewal-cost) err-insufficient-payment)
+      
+      (try! (stx-transfer? platform-fee (get owner key-info) contract-owner))
+      (try! (stx-transfer? (- renewal-cost platform-fee) (get owner key-info) (get provider service)))
+      
+      (let ((updated-key {
+              service-id: (get service-id key-info),
+              owner: (get owner key-info),
+              calls-remaining: calls-allowed,
+              period-start: stacks-block-height,
+              period-end: (+ stacks-block-height (get period-duration service)),
+              total-calls-made: (get total-calls-made key-info),
+              created-at: (get created-at key-info),
+              active: true,
+              subscription-tier: (get subscription-tier key-info),
+              auto-renewal: (get auto-renewal key-info),
+              last-used: (get last-used key-info),
+              refund-eligible-until: (+ stacks-block-height max-refund-period)
+            }))
+        (map-set api-keys key-id updated-key)
+        (var-set platform-revenue (+ (var-get platform-revenue) platform-fee))
+        (ok updated-key)))))
+
+(define-public (transfer-api-key (key-id uint) (recipient principal))
+  (let ((caller tx-sender))
+    (asserts! (is-eq caller (unwrap! (nft-get-owner? api-key-nft key-id) err-not-found)) err-unauthorized)
+    
+    (try! (nft-transfer? api-key-nft key-id caller recipient))
+    
+    (let ((key-info (unwrap! (map-get? api-keys key-id) err-not-found)))
+      (ok (map-set api-keys key-id
+        (merge key-info {owner: recipient}))))))
+
+(define-public (toggle-auto-renewal (key-id uint) (enable bool))
+  (let ((key-info (unwrap! (map-get? api-keys key-id) err-not-found))
+        (caller tx-sender))
+    (asserts! (is-eq caller (get owner key-info)) err-unauthorized)
+    (ok (map-set api-keys key-id
+      (merge key-info {auto-renewal: enable})))))
+
+(define-private (update-user-reputation (user principal) (service-id uint) (calls-made uint))
+  (let ((current-rep (default-to 
+                       {total-api-calls: u0, services-used: u0, reputation-score: u100, violations: u0, join-date: stacks-block-height}
+                       (map-get? user-reputation user))))
+    (map-set user-reputation user
+      (merge current-rep {
+        total-api-calls: (+ (get total-api-calls current-rep) calls-made),
+        services-used: (if (> calls-made u0) 
+                        (+ (get services-used current-rep) u1)
+                        (get services-used current-rep)),
+        reputation-score: (get-min max-reputation-score (+ (get reputation-score current-rep) (/ calls-made u10)))
+      }))
+    true))
+
+(define-public (deactivate-service (service-id uint))
+  (let ((service (unwrap! (map-get? api-services service-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get provider service)) err-unauthorized)
+    (ok (map-set api-services service-id
+      (merge service {active: false})))))
+
+(define-public (update-service-pricing 
+  (service-id uint)
+  (new-price-per-call uint)
+  (new-rate-limit uint))
+  (let ((service (unwrap! (map-get? api-services service-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get provider service)) err-unauthorized)
+    (asserts! (>= new-price-per-call min-service-price) err-invalid-parameters)
+    (ok (map-set api-services service-id
+      (merge service {
+        price-per-call: new-price-per-call,
+        rate-limit-per-second: new-rate-limit
+      })))))
+
+(define-public (emergency-deactivate-key (key-id uint))
+  (let ((key-info (unwrap! (map-get? api-keys key-id) err-not-found))
+        (service (unwrap! (map-get? api-services (get service-id key-info)) err-not-found)))
+    (asserts! (or (is-eq tx-sender contract-owner) 
+                  (is-eq tx-sender (get provider service))
+                  (is-eq tx-sender (get owner key-info))) err-unauthorized)
+    
+    (ok (map-set api-keys key-id
+      (merge key-info {active: false})))))
+
+;; Read-only functions
+(define-read-only (get-service-info (service-id uint))
+  (map-get? api-services service-id))
+
+(define-read-only (get-api-key-info (key-id uint))
+  (map-get? api-keys key-id))
+
+(define-read-only (get-usage-log (key-id uint) (log-id uint))
+  (map-get? api-usage-logs {key-id: key-id, log-id: log-id}))
+
+(define-read-only (get-subscription-tier (service-id uint) (tier-id uint))
+  (map-get? subscription-tiers {service-id: service-id, tier-id: tier-id}))
+
+(define-read-only (get-user-reputation (user principal))
+  (map-get? user-reputation user))
+
+(define-read-only (get-key-owner (key-id uint))
+  (nft-get-owner? api-key-nft key-id))
+
+(define-read-only (is-user-whitelisted (service-id uint) (user principal))
+  (default-to false (map-get? service-whitelist {service-id: service-id, user: user})))
+
+(define-read-only (get-platform-stats)
+  {
+    total-services: (var-get total-services),
+    total-active-keys: (var-get total-active-keys),
+    platform-revenue: (var-get platform-revenue),
+    next-service-id: (var-get next-service-id),
+    next-key-id: (var-get next-key-id)
+  })
+
+(define-read-only (check-key-validity (key-id uint))
+  (let ((key-info (map-get? api-keys key-id)))
+    (match key-info
+      key-data
+      {
+        valid: (and (get active key-data) 
+                    (> (get calls-remaining key-data) u0)
+                    (<= stacks-block-height (get period-end key-data))),
+        calls-remaining: (get calls-remaining key-data),
+        expires-at: (get period-end key-data),
+        owner: (get owner key-data),
+        auto-renewal: (get auto-renewal key-data),
+        last-used: (get last-used key-data)
+      }
+      {
+        valid: false,
+        calls-remaining: u0,
+        expires-at: u0,
+        owner: 'SP000000000000000000002Q6VF78,
+        auto-renewal: false,
+        last-used: u0
+      })))
+
+(define-read-only (get-service-revenue (service-id uint))
+  (let ((service (map-get? api-services service-id)))
+    (match service
+      service-data (get total-revenue service-data)
+      u0)))
