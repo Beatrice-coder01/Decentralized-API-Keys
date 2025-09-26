@@ -19,6 +19,7 @@
 (define-constant max-refund-period u144) ;; ~1 day in blocks
 (define-constant platform-fee-rate u50) ;; 0.5% in basis points
 (define-constant min-service-price u1000) ;; Minimum price per call
+(define-constant max-reputation-score u1000) ;; Maximum reputation score
 
 (define-non-fungible-token api-key-nft uint)
 
@@ -110,6 +111,10 @@
 (define-data-var platform-revenue uint u0)
 (define-data-var total-services uint u0)
 (define-data-var total-active-keys uint u0)
+
+;; Helper function to get minimum of two values
+(define-private (get-min (a uint) (b uint))
+  (if (<= a b) a b))
 
 (define-public (register-api-service 
   (name (string-ascii 64))
@@ -354,7 +359,6 @@
     (ok (map-set api-keys key-id
       (merge key-info {auto-renewal: enable})))))
 
-
 (define-private (update-user-reputation (user principal) (service-id uint) (calls-made uint))
   (let ((current-rep (default-to 
                        {total-api-calls: u0, services-used: u0, reputation-score: u100, violations: u0, join-date: block-height}
@@ -365,7 +369,7 @@
         services-used: (if (> calls-made u0) 
                         (+ (get services-used current-rep) u1)
                         (get services-used current-rep)),
-        reputation-score: (min u1000 (+ (get reputation-score current-rep) (/ calls-made u10)))
+        reputation-score: (get-min max-reputation-score (+ (get reputation-score current-rep) (/ calls-made u10)))
       }))
     true))
 
@@ -398,6 +402,7 @@
     (ok (map-set api-keys key-id
       (merge key-info {active: false})))))
 
+;; Read-only functions
 (define-read-only (get-service-info (service-id uint))
   (map-get? api-services service-id))
 
