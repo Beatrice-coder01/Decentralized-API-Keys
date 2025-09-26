@@ -140,7 +140,7 @@
       max-calls-per-period: max-calls-per-period,
       period-duration: period-duration,
       active: true,
-      created-at: block-height,
+      created-at: stacks-block-height,
       category: category,
       api-version: api-version,
       rate-limit-per-second: rate-limit-per-second,
@@ -210,15 +210,15 @@
         service-id: service-id,
         owner: caller,
         calls-remaining: calls-allowed,
-        period-start: block-height,
-        period-end: (+ block-height (get period-duration service)),
+        period-start: stacks-block-height,
+        period-end: (+ stacks-block-height (get period-duration service)),
         total-calls-made: u0,
-        created-at: block-height,
+        created-at: stacks-block-height,
         active: true,
         subscription-tier: subscription-tier,
         auto-renewal: enable-auto-renewal,
         last-used: u0,
-        refund-eligible-until: (+ block-height max-refund-period)
+        refund-eligible-until: (+ stacks-block-height max-refund-period)
       })
       
       ;; Update service statistics
@@ -250,21 +250,21 @@
     (asserts! (>= (get calls-remaining key-info) calls-to-use) err-usage-exceeded)
     
     ;; Check if period has expired and needs renewal
-    (let ((current-key (if (> block-height (get period-end key-info))
+    (let ((current-key (if (> stacks-block-height (get period-end key-info))
                          (if (get auto-renewal key-info)
                            (try! (renew-key-period key-id))
                            key-info)
                          key-info)))
       
       ;; Check if still valid after potential renewal
-      (asserts! (<= block-height (get period-end current-key)) err-subscription-expired)
+      (asserts! (<= stacks-block-height (get period-end current-key)) err-subscription-expired)
       
       ;; Log usage
       (let ((log-id (default-to u0 (map-get? key-usage-counter key-id))))
         (map-set api-usage-logs 
           {key-id: key-id, log-id: (+ log-id u1)}
           {
-            timestamp: block-height,
+            timestamp: stacks-block-height,
             calls-used: calls-to-use,
             endpoint: endpoint,
             response-size: response-size,
@@ -278,7 +278,7 @@
       (let ((updated-key (merge current-key {
               calls-remaining: (- (get calls-remaining current-key) calls-to-use),
               total-calls-made: (+ (get total-calls-made current-key) calls-to-use),
-              last-used: block-height
+              last-used: stacks-block-height
             })))
         (map-set api-keys key-id updated-key)
         (update-user-reputation caller (get service-id key-info) calls-to-use)
@@ -291,7 +291,7 @@
     
     (asserts! (is-eq caller (get owner key-info)) err-unauthorized)
     (asserts! (get active key-info) err-not-found)
-    (asserts! (<= block-height (get refund-eligible-until key-info)) err-refund-failed)
+    (asserts! (<= stacks-block-height (get refund-eligible-until key-info)) err-refund-failed)
     (asserts! (is-eq (get total-calls-made key-info) u0) err-refund-failed)
     
     (let ((refund-amount (/ (* (get price-per-call service) (get calls-remaining key-info)) u1))
@@ -328,15 +328,15 @@
               service-id: (get service-id key-info),
               owner: (get owner key-info),
               calls-remaining: calls-allowed,
-              period-start: block-height,
-              period-end: (+ block-height (get period-duration service)),
+              period-start: stacks-block-height,
+              period-end: (+ stacks-block-height (get period-duration service)),
               total-calls-made: (get total-calls-made key-info),
               created-at: (get created-at key-info),
               active: true,
               subscription-tier: (get subscription-tier key-info),
               auto-renewal: (get auto-renewal key-info),
               last-used: (get last-used key-info),
-              refund-eligible-until: (+ block-height max-refund-period)
+              refund-eligible-until: (+ stacks-block-height max-refund-period)
             }))
         (map-set api-keys key-id updated-key)
         (var-set platform-revenue (+ (var-get platform-revenue) platform-fee))
@@ -361,7 +361,7 @@
 
 (define-private (update-user-reputation (user principal) (service-id uint) (calls-made uint))
   (let ((current-rep (default-to 
-                       {total-api-calls: u0, services-used: u0, reputation-score: u100, violations: u0, join-date: block-height}
+                       {total-api-calls: u0, services-used: u0, reputation-score: u100, violations: u0, join-date: stacks-block-height}
                        (map-get? user-reputation user))))
     (map-set user-reputation user
       (merge current-rep {
@@ -440,7 +440,7 @@
       {
         valid: (and (get active key-data) 
                     (> (get calls-remaining key-data) u0)
-                    (<= block-height (get period-end key-data))),
+                    (<= stacks-block-height (get period-end key-data))),
         calls-remaining: (get calls-remaining key-data),
         expires-at: (get period-end key-data),
         owner: (get owner key-data),
